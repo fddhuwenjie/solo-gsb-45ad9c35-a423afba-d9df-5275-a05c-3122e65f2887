@@ -159,7 +159,7 @@ class HandoverTask(Base):
     start_ts: Mapped[float] = mapped_column(Float)        # 有效窗口开始（epoch 秒，含）
     end_ts: Mapped[float] = mapped_column(Float)          # 有效窗口结束（epoch 秒，不含，须晚于开始）
     max_gap_s: Mapped[float] = mapped_column(Float)       # 相邻交班允许的最大空档（秒，非负）
-    min_overlap_s: Mapped[float] = mapped_column(Float)   # 相邻交班要求的最短交叠（秒，正数）
+    min_overlap_s: Mapped[float] = mapped_column(Float)   # 相邻交班要求的最短交叠（秒，非负）
     created_at: Mapped[float] = mapped_column(Float)
 
 

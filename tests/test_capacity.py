@@ -1,5 +1,12 @@
 from datetime import datetime, timedelta, timezone
 
+from app.engine import (
+    EVENT_ENTER,
+    EVENT_LEAVE,
+    compute_occupancy_segments,
+    presence_intervals,
+)
+
 BASE = datetime(2026, 9, 22, 12, 0, 0, tzinfo=timezone.utc)
 
 PLAIN_FENCE = {
@@ -266,3 +273,23 @@ def test_backfilled_points_trigger_recomputed_occupancy(client):
     later = [s for s in segs if datetime.fromisoformat(s["start"]) >= ts(150)]
     assert all(not s["exceeded"] for s in later)
     assert [s["count"] for s in later] == [1]
+
+
+# ---------- 引擎级：同刻 leave+enter 离开先重放 ----------
+
+
+def test_engine_same_instant_leave_enter_preserves_new_interval():
+    # 同刻 leave+enter：离开先配对，旧段 [0,100) 与新段 [100,200) 都保留
+    events = [
+        ("d", EVENT_ENTER, 0), ("d", EVENT_LEAVE, 100),
+        ("d", EVENT_ENTER, 100), ("d", EVENT_LEAVE, 200),
+    ]
+    assert presence_intervals(events) == [("d", 0, 100), ("d", 100, 200)]
+
+    # 查询窗口自该刻开始：设备按新段持续在场，占用计数不得丢失新一段
+    segs = compute_occupancy_segments(events, [], 100, 200)
+    assert [(s.start, s.end, s.count) for s in segs] == [(100, 200, 1)]
+
+    # 跨越该刻的窗口同样全程计 1 人（两段首尾相接）
+    segs = compute_occupancy_segments(events, [], 50, 150)
+    assert [(s.start, s.end, s.count) for s in segs] == [(50, 150, 1)]

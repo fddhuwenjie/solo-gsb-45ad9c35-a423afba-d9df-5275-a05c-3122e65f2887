@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+from app.engine import EVENT_ENTER, EVENT_LEAVE, compute_clearance
+
 BASE = datetime(2026, 9, 30, 12, 0, 0, tzinfo=timezone.utc)
 
 PLAIN_FENCE = {
@@ -239,3 +241,46 @@ def test_delete_fence_removes_clearance_tasks(client):
     assert client.get(f"/fences/{fence_id}/clearance-tasks").status_code == 404
     new_id = create_fence(client)
     assert client.get(f"/fences/{new_id}/clearance-tasks").json() == []
+
+
+# ---------- 引擎级：同刻 leave+enter 离开先重放 ----------
+
+
+def test_engine_same_instant_leave_enter_leave_first():
+    # 窗口内 t=150 同刻离开又进入，新段持续到截止未再离开 -> remaining；
+    # enter 先重放会吞掉新段并误报 cleared。
+    events = [
+        ("d", EVENT_ENTER, 0), ("d", EVENT_LEAVE, 150),
+        ("d", EVENT_ENTER, 150),
+    ]
+    rep = compute_clearance(events, 100, 300)
+    assert rep.start_count == 1
+    assert rep.results[0].status == "remaining"
+    assert rep.results[0].last_leave_ts is None
+
+    # 同刻折返后再次离开：新段止端 260 才是最后有效离开时刻
+    events = [
+        ("d", EVENT_ENTER, 0), ("d", EVENT_LEAVE, 150),
+        ("d", EVENT_ENTER, 150), ("d", EVENT_LEAVE, 260),
+    ]
+    rep = compute_clearance(events, 100, 300)
+    assert rep.results[0].status == "cleared"
+    assert rep.results[0].last_leave_ts == 260
+
+    # start 处同刻 leave+enter：连续在场，应进入起始名单并按时清场
+    events = [
+        ("d", EVENT_ENTER, 0), ("d", EVENT_LEAVE, 100),
+        ("d", EVENT_ENTER, 100), ("d", EVENT_LEAVE, 200),
+    ]
+    rep = compute_clearance(events, 100, 300)
+    assert rep.start_count == 1
+    assert rep.results[0].status == "cleared"
+    assert rep.results[0].last_leave_ts == 200
+
+    # deadline 处同刻 leave+enter：新区间起端含截止刻 -> remaining
+    events = [
+        ("d", EVENT_ENTER, 0), ("d", EVENT_LEAVE, 300),
+        ("d", EVENT_ENTER, 300),
+    ]
+    rep = compute_clearance(events, 100, 300)
+    assert rep.results[0].status == "remaining"

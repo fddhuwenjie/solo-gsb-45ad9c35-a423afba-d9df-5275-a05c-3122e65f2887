@@ -122,8 +122,13 @@ def test_create_task_validation_and_crud(client):
     assert bad({"start_at": iso(10), "end_at": iso(10)}).status_code == 422  # 窗口无效
     assert bad({"start_at": iso(20), "end_at": iso(10)}).status_code == 422
     assert bad({"max_gap_s": -1}).status_code == 422                # 空档上限非负
-    assert bad({"min_overlap_s": 0}).status_code == 422             # 最短交叠为正
-    assert bad({"min_overlap_s": -1}).status_code == 422
+    assert bad({"min_overlap_s": -1}).status_code == 422            # 最短交叠非负
+    # min_overlap_s=0 合法：只要两段真正相交即达标（契约与引擎判定一致）
+    created = bad({"min_overlap_s": 0})
+    assert created.status_code == 201
+    assert client.delete(
+        f"/fences/{fence_id}/handover-tasks/{created.json()['id']}"
+    ).status_code == 204
     assert bad({"name": ""}).status_code == 422
 
     task = create_task(client, fence_id, members=("d2", "d0", "d1"), name="交班A")
@@ -340,12 +345,16 @@ def test_report_rebuilt_after_backfill(client):
     rep = report(client, fence_id, task["id"])
     assert rep["passed"] is False
     assert rep["steps"][1]["status"] == "overlap_insufficient"
+    # 首个违规时刻 = 交叠结束 200
+    assert datetime.fromisoformat(rep["first_violation_at"]) == dts(200)
 
     # 补录乱序点：d1 在 170 已进入（早于先前首点），交叠变 30s -> 通过
     submit(client, [pt("d1", 170)])
     rep = report(client, fence_id, task["id"])
     assert rep["passed"] is True
     assert datetime.fromisoformat(rep["steps"][1]["interval_start"]) == dts(170)
+    # 违规已随重算清除，首个违规时刻同步回到 null（旧结果不残留）
+    assert rep["first_violation_at"] is None
 
     # 再补录：d0 在 175 离开后 190 才回，d1[170,260) 与 d0 首段 [50,175) 交叠仅 5s，
     # 与 d0 次段 [190,...) 比较时接班时刻不得早于 d0 次段到岗 -> 无满足时间推进的交叠，
@@ -358,6 +367,25 @@ def test_report_rebuilt_after_backfill(client):
     rep = report(client, fence_id, task["id"])
     assert rep["passed"] is False
     assert rep["steps"][1]["status"] in {"overlap_insufficient", "gap_exceeded", "absent"}
+    # 首个违规时刻按最新链重新给出（交叠在 d0 首段止端 175 结束）
+    assert datetime.fromisoformat(rep["first_violation_at"]) == dts(175)
+
+
+def test_min_overlap_zero_accepted(client):
+    fence_id = create_fence(client)
+    # d0[150,200)、d1[199,300)：交叠仅 1s。min_overlap_s=0 时创建并核验通过，
+    # 与引擎对 min_overlap_s=0 的判定保持一致
+    submit(client, [
+        pt("d0", 150), pt("d0", 200, inside=False),
+        pt("d1", 199), pt("d1", 300, inside=False),
+    ])
+    task = create_task(
+        client, fence_id, members=("d0", "d1"), max_gap=30, min_overlap=0
+    )
+    assert task["min_overlap_s"] == 0
+    rep = report(client, fence_id, task["id"])
+    assert rep["passed"] is True
+    assert rep["passed_steps"] == 1
 
 
 def test_events_scoped_to_fence(client):
@@ -476,3 +504,90 @@ def test_engine_absent_candidate_before_takeover():
     assert rep.passed is False
     assert rep.steps[1].status == "absent"
     assert rep.steps[1].violation_ts == 400
+
+
+def test_engine_converging_prefixes_keep_lex_earliest_chain():
+    # 多个前缀汇聚到后续区间（两层菱形）：
+    # a: [10,35)、[40,90)
+    # b: [38,46)（仅 a1 可接：空档 3；对 a2 时间倒退）
+    #    [46,85)（仅 a2 可接：首尾相接；与 a1 空档 11 > max_gap）
+    # c: [56,110)（两个前缀都能接：b1 交叠 29；b2 空档 10）
+    # 通过步数并列（均为 2 步），必须保留完整接班元组字典序更早的
+    # a1 -> b1 -> c（元组 (38,56)），而不是较晚的 a2 -> b2 -> c（(46,56)）。
+    events = [
+        ("a", EVENT_ENTER, 10), ("a", EVENT_LEAVE, 35),
+        ("a", EVENT_ENTER, 40), ("a", EVENT_LEAVE, 90),
+        ("b", EVENT_ENTER, 38), ("b", EVENT_LEAVE, 46),
+        ("b", EVENT_ENTER, 46), ("b", EVENT_LEAVE, 85),
+        ("c", EVENT_ENTER, 56), ("c", EVENT_LEAVE, 110),
+    ]
+    rep = engine_report(events, ["a", "b", "c"], max_gap=10, min_overlap=10)
+    assert rep.passed is True
+    assert rep.passed_steps == 2
+    assert [s.takeover_ts for s in rep.steps] == [10, 38, 56]
+    assert rep.steps[0].interval_start == 10 and rep.steps[0].interval_end == 35
+    assert rep.steps[1].interval_start == 38 and rep.steps[1].interval_end == 46
+
+    # 三层菱形：汇聚点 c 之后还有一台接班失败，验证失败判定基于保留下来的早链。
+    # a1[10,40)、a2[40,80)（同刻 leave+enter 离开先配对成两段）；
+    # b1[30,52) 仅 a1 可接（交叠 12；b1 起端早于 a2 到岗，时间不推进）；
+    # b2[55,90) 仅 a2 可接（交叠 25；对 a1 空档 15 > max_gap）；
+    # c[58,100) 与 b1 空档 6、与 b2 交叠 32，两个前缀都能接 -> 汇聚；
+    # d[98,130) 与 c 交叠 2 < 10 -> overlap_insufficient（交叠结束于 100）。
+    # 两条 3 设备链步数相同（各 2 步），汇聚节点 c 必须保留接班元组
+    # (30,58) 的早链；旧逻辑保留较晚的 (55,58)，回溯会错取 a2/b2 区间。
+    events_fail = [
+        ("a", EVENT_ENTER, 10), ("a", EVENT_LEAVE, 40),
+        ("a", EVENT_ENTER, 40), ("a", EVENT_LEAVE, 80),
+        ("b", EVENT_ENTER, 30), ("b", EVENT_LEAVE, 52),
+        ("b", EVENT_ENTER, 55), ("b", EVENT_LEAVE, 90),
+        ("c", EVENT_ENTER, 58), ("c", EVENT_LEAVE, 100),
+        ("d", EVENT_ENTER, 98), ("d", EVENT_LEAVE, 130),
+    ]
+    rep_fail = engine_report(
+        events_fail, ["a", "b", "c", "d"], max_gap=10, min_overlap=10
+    )
+    assert rep_fail.passed is False
+    assert rep_fail.passed_steps == 2
+    assert [s.takeover_ts for s in rep_fail.steps[:3]] == [10, 30, 58]
+    d_step = rep_fail.steps[3]
+    assert d_step.status == "overlap_insufficient"
+    assert d_step.violation_ts == 100
+
+
+def test_engine_same_instant_leave_enter_handover_leave_first():
+    # b 在 t=100 同刻离开又进入（离开先配对，两段 [50,100) 与 [100,150)）：
+    # a[0,100) 与 b 旧段交叠 50 达标；c[100,200) 与 b 新段首尾相接（空档 0）
+    # 达标 -> 整条链通过。若错误按 enter 先处理，b 的新段被吞掉，c 接班无区间
+    # 可接，会被误判为 gap_exceeded。
+    events = [
+        ("a", EVENT_ENTER, 0), ("a", EVENT_LEAVE, 100),
+        ("b", EVENT_ENTER, 50), ("b", EVENT_LEAVE, 100),
+        ("b", EVENT_ENTER, 100), ("b", EVENT_LEAVE, 150),
+        ("c", EVENT_ENTER, 100), ("c", EVENT_LEAVE, 200),
+    ]
+    rep = engine_report(events, ["a", "b", "c"], start=0, end=200,
+                        max_gap=0, min_overlap=10)
+    assert rep.passed is True
+    assert rep.passed_steps == 2
+    assert [s.takeover_ts for s in rep.steps] == [0, 50, 100]
+    assert rep.steps[1].interval_start == 50 and rep.steps[1].interval_end == 100
+
+
+def test_engine_min_overlap_zero_accepted():
+    # min_overlap_s=0：只要两段真正相交（接班起端 < 交班止端）即达标
+    events = [
+        ("a", EVENT_ENTER, 0), ("a", EVENT_LEAVE, 100),
+        ("b", EVENT_ENTER, 99), ("b", EVENT_LEAVE, 200),
+    ]
+    rep = engine_report(events, ["a", "b"], max_gap=30, min_overlap=0)
+    assert rep.passed is True
+
+    # 仅首尾相接（无真正相交）时不受 min_overlap=0 影响，仍按空档判定：
+    # max_gap=0 允许空档 0 -> 通过
+    events = [
+        ("a", EVENT_ENTER, 0), ("a", EVENT_LEAVE, 100),
+        ("b", EVENT_ENTER, 100), ("b", EVENT_LEAVE, 200),
+    ]
+    rep = engine_report(events, ["a", "b"], max_gap=0, min_overlap=0)
+    assert rep.passed is True

@@ -307,7 +307,7 @@ class HandoverTaskCreate(BaseModel):
         ge=0, description="相邻交班两段区间分离时允许的最大空档（秒，非负）；等于上限允许"
     )
     min_overlap_s: float = Field(
-        gt=0, description="相邻交班两段区间相交时要求的最短交叠（秒，正数）；等于门槛算达标"
+        ge=0, description="相邻交班两段区间相交时要求的最短交叠（秒，非负）；等于门槛算达标，0 表示只要真正相交即可"
     )
 
     @model_validator(mode="after")
