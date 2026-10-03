@@ -122,8 +122,7 @@ def test_create_task_validation_and_crud(client):
     assert bad({"start_at": iso(10), "end_at": iso(10)}).status_code == 422  # 窗口无效
     assert bad({"start_at": iso(20), "end_at": iso(10)}).status_code == 422
     assert bad({"max_gap_s": -1}).status_code == 422                # 空档上限非负
-    assert bad({"min_overlap_s": 0}).status_code == 422             # 最短交叠为正
-    assert bad({"min_overlap_s": -1}).status_code == 422
+    assert bad({"min_overlap_s": -1}).status_code == 422            # 最短交叠非负
     assert bad({"name": ""}).status_code == 422
 
     task = create_task(client, fence_id, members=("d2", "d0", "d1"), name="交班A")
@@ -150,6 +149,24 @@ def test_create_task_validation_and_crud(client):
     assert client.get(
         f"/fences/{other}/handover-tasks/{tasks[1]['id']}/report"
     ).status_code == 404
+
+
+def test_min_overlap_zero_accepted(client):
+    # min_overlap_s=0 合法：请求契约与引擎判定一致（相交即达标）
+    fence_id = create_fence(client)
+    r = client.post(
+        f"/fences/{fence_id}/handover-tasks",
+        json={
+            "name": "零交叠",
+            "members": ["a", "b"],
+            "start_at": iso(0),
+            "end_at": iso(10),
+            "max_gap_s": 0,
+            "min_overlap_s": 0,
+        },
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["min_overlap_s"] == 0.0
 
 
 def test_passing_overlap_chain(client):
@@ -340,12 +357,14 @@ def test_report_rebuilt_after_backfill(client):
     rep = report(client, fence_id, task["id"])
     assert rep["passed"] is False
     assert rep["steps"][1]["status"] == "overlap_insufficient"
+    assert datetime.fromisoformat(rep["first_violation_at"]) == dts(200)
 
     # 补录乱序点：d1 在 170 已进入（早于先前首点），交叠变 30s -> 通过
     submit(client, [pt("d1", 170)])
     rep = report(client, fence_id, task["id"])
     assert rep["passed"] is True
     assert datetime.fromisoformat(rep["steps"][1]["interval_start"]) == dts(170)
+    assert rep["first_violation_at"] is None
 
     # 再补录：d0 在 175 离开后 190 才回，d1[170,260) 与 d0 首段 [50,175) 交叠仅 5s，
     # 与 d0 次段 [190,...) 比较时接班时刻不得早于 d0 次段到岗 -> 无满足时间推进的交叠，
@@ -358,6 +377,75 @@ def test_report_rebuilt_after_backfill(client):
     rep = report(client, fence_id, task["id"])
     assert rep["passed"] is False
     assert rep["steps"][1]["status"] in {"overlap_insufficient", "gap_exceeded", "absent"}
+    # 首个违规时刻随重建同步更新（首段交叠在 175 结束），不得残留旧值 200 或 null
+    assert datetime.fromisoformat(rep["first_violation_at"]) == dts(175)
+
+
+def test_converging_prefixes_keep_extendable_chain_after_backfill(client):
+    # 补录后新前缀汇聚到后续区间并把失败链变成全通过链：旧违规状态不得残留。
+    # 初期：d0 全窗在场（未离开）；d1 仅早段 [150,200)；d2 仅早段 [195,240)
+    # （与 d1 交叠 5s<10，接不上）；d3[350,400) 尚未有人能接。
+    fence_id = create_fence(client)
+    submit(client, [
+        pt("d0", 0),
+        pt("d1", 150), pt("d1", 200, inside=False),
+        pt("d2", 195), pt("d2", 240, inside=False),
+        pt("d3", 350), pt("d3", 400, inside=False),
+    ])
+    task = create_task(
+        client, fence_id, members=("d0", "d1", "d2", "d3"),
+        start=0, end=400, max_gap=30, min_overlap=10,
+    )
+    rep = report(client, fence_id, task["id"])
+    assert rep["passed_steps"] == 1
+    assert rep["steps"][1]["status"] == "passed"
+    assert rep["steps"][2]["status"] == "overlap_insufficient"
+    assert datetime.fromisoformat(rep["first_violation_at"]) == dts(200)
+
+    # 乱序补录：d1 晚段 [250,320) 与 d2 晚段 [300,360)。
+    # d0->d1 晚段（交叠 70s）、d1 晚段->d2 晚段（交叠 20s）、
+    # d2 晚段->d3[350,400)（交叠 10s）逐边成立，形成 3 步全通过链。
+    submit(client, [
+        pt("d1", 250), pt("d1", 320, inside=False),
+        pt("d2", 300), pt("d2", 360, inside=False),
+    ])
+    rep = report(client, fence_id, task["id"])
+    assert rep["passed"] is True
+    assert rep["passed_steps"] == 3
+    assert datetime.fromisoformat(rep["steps"][1]["interval_start"]) == dts(250)
+    assert datetime.fromisoformat(rep["steps"][2]["interval_start"]) == dts(300)
+    assert datetime.fromisoformat(rep["steps"][3]["takeover_at"]) == dts(350)
+    assert rep["first_violation_at"] is None
+
+
+def test_converging_prefixes_tie_picks_lex_earliest(client):
+    # 步数并列的汇聚前缀：d1 早段与晚段都能交班给同一个 d2 区间，两条 3 步链
+    # 在 d2[300,360) 汇聚，接班元组分别为 (150,300,350) 与 (280,300,350)。
+    # 步数并列必须保留字典序更早的早段链，不得按较晚接班元组保留而选错链。
+    fence_id = create_fence(client)
+    # 乱序提交（补录风格），引擎按设备时间重排后结果一致
+    submit(client, [
+        pt("d3", 400, inside=False), pt("d1", 280),
+        pt("d2", 360, inside=False), pt("d1", 275, inside=False),
+        pt("d0", 330, inside=False), pt("d2", 300),
+        pt("d3", 350), pt("d1", 150),
+        pt("d0", 0), pt("d1", 295, inside=False),
+    ])
+    # 实际区间：d0[0,330)；d1[150,275)、[280,295)；d2[300,360)；d3[350,400)
+    # d0->d1 早段交叠 125s、晚段交叠 15s（均 >=10）；
+    # d1 早段->d2 空档 25、晚段->d2 空档 5（均 <=30）；d2->d3 交叠 10s。
+    task = create_task(
+        client, fence_id, members=("d0", "d1", "d2", "d3"),
+        start=0, end=400, max_gap=30, min_overlap=10,
+    )
+    rep = report(client, fence_id, task["id"])
+    assert rep["passed"] is True
+    assert rep["passed_steps"] == 3
+    assert datetime.fromisoformat(rep["steps"][0]["interval_end"]) == dts(330)
+    assert datetime.fromisoformat(rep["steps"][1]["takeover_at"]) == dts(150)
+    assert datetime.fromisoformat(rep["steps"][1]["interval_end"]) == dts(275)
+    assert datetime.fromisoformat(rep["steps"][2]["takeover_at"]) == dts(300)
+    assert datetime.fromisoformat(rep["steps"][3]["takeover_at"]) == dts(350)
 
 
 def test_events_scoped_to_fence(client):
@@ -476,3 +564,65 @@ def test_engine_absent_candidate_before_takeover():
     assert rep.passed is False
     assert rep.steps[1].status == "absent"
     assert rep.steps[1].violation_ts == 400
+
+
+def test_engine_min_overlap_zero_touching_intervals():
+    # min_overlap_s=0：只要两段相交即达标；首尾相接仍按空档判定
+    events = [
+        ("a", EVENT_ENTER, 0), ("a", EVENT_LEAVE, 100),
+        ("b", EVENT_ENTER, 99), ("b", EVENT_LEAVE, 200),
+    ]
+    rep = engine_report(events, ["a", "b"], max_gap=0, min_overlap=0)
+    assert rep.passed is True  # 仅 1s 交叠，门槛 0 即达标
+
+    # 严格分离 1s 且 max_gap=0：不允许，与 min_overlap=0 无关
+    events = [
+        ("a", EVENT_ENTER, 0), ("a", EVENT_LEAVE, 100),
+        ("b", EVENT_ENTER, 101), ("b", EVENT_LEAVE, 200),
+    ]
+    rep = engine_report(events, ["a", "b"], max_gap=0, min_overlap=0)
+    assert rep.passed is False
+    assert rep.steps[1].status == "gap_exceeded"
+
+
+def test_engine_same_instant_handover_leave_first():
+    # a 在 t=200 同刻 leave+enter：按离开先配对，a 有 [0,200) 与 [200,400) 两段。
+    # b[150,200) 与 a 首段交叠 50s -> 通过；b 在 t=200 同刻 leave（半开不含 200）。
+    events = [
+        ("a", EVENT_ENTER, 0), ("a", EVENT_LEAVE, 200),
+        ("a", EVENT_ENTER, 200), ("a", EVENT_LEAVE, 400),
+        ("b", EVENT_ENTER, 150), ("b", EVENT_LEAVE, 200),
+    ]
+    rep = engine_report(events, ["a", "b"], max_gap=0, min_overlap=50)
+    assert rep.passed is True
+    assert rep.steps[0].interval_start == 0
+    assert rep.steps[0].interval_end == 200
+    assert rep.steps[1].takeover_ts == 150
+    assert rep.steps[1].interval_end == 200
+
+    # 反向交班顺序 b->a：a 必须在 b 接班之后到岗。b[150,200) -> a[200,400)
+    # 首尾相接（空档 0），max_gap=0 允许 -> 通过，a 取同刻新段而非被 enter 优先吞掉
+    rep = engine_report(events, ["b", "a"], max_gap=0, min_overlap=0)
+    assert rep.passed is True
+    assert rep.steps[1].takeover_ts == 200
+    assert rep.steps[1].interval_end == 400
+
+
+def test_engine_converging_prefixes_preserve_earliest_tuple():
+    # 两个一步前缀汇聚到同一 d2 区间后还能继续延伸到 d3。
+    events = [
+        ("a", EVENT_ENTER, 0), ("a", EVENT_LEAVE, 330),
+        ("b", EVENT_ENTER, 150), ("b", EVENT_LEAVE, 275),
+        ("b", EVENT_ENTER, 280), ("b", EVENT_LEAVE, 295),
+        ("c", EVENT_ENTER, 300), ("c", EVENT_LEAVE, 360),
+        ("d", EVENT_ENTER, 350), ("d", EVENT_LEAVE, 400),
+    ]
+    # a->b 两段均交叠达标；b 两段 -> c[300,360) 空档分别 25/5（<=30）；c->d 交叠 10
+    rep = engine_report(events, ["a", "b", "c", "d"], max_gap=30, min_overlap=10)
+    assert rep.passed is True
+    assert rep.passed_steps == 3
+    # 汇聚候选步数相同：接班元组 (150,300,350) 字典序早于 (280,300,350)
+    assert rep.steps[1].takeover_ts == 150
+    assert rep.steps[1].interval_end == 275
+    assert rep.steps[2].takeover_ts == 300
+    assert rep.steps[3].takeover_ts == 350

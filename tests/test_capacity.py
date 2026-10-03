@@ -266,3 +266,40 @@ def test_backfilled_points_trigger_recomputed_occupancy(client):
     later = [s for s in segs if datetime.fromisoformat(s["start"]) >= ts(150)]
     assert all(not s["exceeded"] for s in later)
     assert [s["count"] for s in later] == [1]
+
+
+# ---------- 引擎级：同刻 leave+enter（离开先、进入后） ----------
+
+
+from app.engine import (  # noqa: E402
+    EVENT_ENTER,
+    EVENT_LEAVE,
+    compute_occupancy_segments,
+    presence_intervals,
+)
+
+
+def test_engine_presence_same_instant_leave_enter_leave_first():
+    # 同设备 t=100 leave+enter：旧区间 [0,100) 先闭合，新区间 [100,150) 后开启
+    events = [
+        ("dev1", EVENT_ENTER, 0), ("dev1", EVENT_LEAVE, 100),
+        ("dev1", EVENT_ENTER, 100), ("dev1", EVENT_LEAVE, 150),
+    ]
+    assert presence_intervals(events) == [("dev1", 0, 100), ("dev1", 100, 150)]
+
+
+def test_engine_occupancy_same_instant_leave_enter_keeps_new_segment():
+    # enter 先配对会吞掉同刻 enter、丢掉 [100,150) 新一段并漏掉 t=120 的超限
+    events = [
+        ("dev1", EVENT_ENTER, 0), ("dev1", EVENT_LEAVE, 100),
+        ("dev1", EVENT_ENTER, 100), ("dev1", EVENT_LEAVE, 150),
+        ("dev2", EVENT_ENTER, 120), ("dev2", EVENT_LEAVE, 140),
+    ]
+    segments = compute_occupancy_segments(events, [(0.0, 1)], 0, 200)
+    pairs = [(s.start, s.end) for s in segments]
+    # [0,100) 与 [100,120) 在场集合相同，按恒定状态分段合并为 [0,120)
+    assert pairs == [(0, 120), (120, 140), (140, 150), (150, 200)]
+    over = [s for s in segments if s.exceeded]
+    assert len(over) == 1
+    assert (over[0].start, over[0].end) == (120, 140)
+    assert over[0].devices == ("dev1", "dev2")

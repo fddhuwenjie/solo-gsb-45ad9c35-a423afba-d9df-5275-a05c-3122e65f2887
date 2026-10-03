@@ -239,3 +239,51 @@ def test_delete_fence_removes_clearance_tasks(client):
     assert client.get(f"/fences/{fence_id}/clearance-tasks").status_code == 404
     new_id = create_fence(client)
     assert client.get(f"/fences/{new_id}/clearance-tasks").json() == []
+
+
+# ---------- 引擎级：同刻 leave+enter（离开先、进入后） ----------
+
+
+from app.engine import (  # noqa: E402
+    CLEARED,
+    EVENT_ENTER,
+    EVENT_LEAVE,
+    REMAINING,
+    compute_clearance,
+)
+
+
+def clearance_devices(rep):
+    return {r.device_id: r for r in rep.results}
+
+
+def test_engine_same_instant_leave_enter_is_remaining():
+    # 起始在场设备 t=250 同刻 leave+enter 后未再离开：新一段 [250,300) 在截止
+    # 仍开着 -> remaining。enter 先处理会吞掉同刻 enter、只剩 [0,250) 误判 cleared。
+    events = [
+        ("flip", EVENT_ENTER, 0), ("flip", EVENT_LEAVE, 250),
+        ("flip", EVENT_ENTER, 250),
+    ]
+    rep = compute_clearance(events, 100, 300)
+    assert rep.start_count == 1 and rep.remaining_count == 1 and rep.cleared_count == 0
+    assert clearance_devices(rep)["flip"].status == REMAINING
+    assert clearance_devices(rep)["flip"].last_leave_ts is None
+
+    # 同刻 leave+enter 恰好发生在截止刻：新区间起端含 deadline -> 仍 remaining
+    events = [
+        ("flip2", EVENT_ENTER, 0), ("flip2", EVENT_LEAVE, 300),
+        ("flip2", EVENT_ENTER, 300),
+    ]
+    rep = compute_clearance(events, 100, 300)
+    assert clearance_devices(rep)["flip2"].status == REMAINING
+
+    # 截止前再离开一次：两段都关闭 -> cleared，最后有效离开取第二次 280
+    events = [
+        ("flip", EVENT_ENTER, 0), ("flip", EVENT_LEAVE, 250),
+        ("flip", EVENT_ENTER, 250), ("flip", EVENT_LEAVE, 280),
+    ]
+    rep = compute_clearance(events, 100, 300)
+    devs = clearance_devices(rep)
+    assert rep.cleared_count == 1
+    assert devs["flip"].status == CLEARED
+    assert devs["flip"].last_leave_ts == 280

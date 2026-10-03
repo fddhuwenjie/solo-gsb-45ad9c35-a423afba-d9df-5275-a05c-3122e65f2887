@@ -5,7 +5,8 @@
 再叠加停留时长（dwell）做抖动去抖，产出 enter / leave / stay 事件。
 
 另含容量核算：由 enter/leave 事件还原设备半开在场区间，结合容量规则
-把查询窗口切分为状态恒定的占用分段并标注超限明细。
+把查询窗口切分为状态恒定的占用分段并标注超限明细。同设备同刻
+leave+enter 一律按离开先配对、进入后开启，与其他实时报告共用半开边界。
 
 应急清场核验：为围栏定义清场窗口 [start, deadline)，由 enter/leave 事件
 还原起始时刻的在场名单（半开边界：start 处的 enter 计入、leave 排除），
@@ -191,8 +192,10 @@ def presence_intervals(events: list[tuple[str, str, float]]) -> list[tuple[str, 
     """由 enter/leave 事件重放每台设备的半开在场区间 [enter, leave)。
 
     输入为 (device_id, event_type, ts)；同时刻同设备事件按 (ts, 类型) 排序，
-    使 enter 先于 leave，与半开语义一致。未配对的 enter（最终仍未离开）
-    其区间止端取 +inf，交由调用方按窗口截断。
+    使 leave 先于 enter——同一设备同刻离开又进入时旧区间先以 t 为止端配对、
+    新区间再以 t 为起端开启（旧区间止端不含 t、新区间起端含 t），与清场、
+    协同到场、交班的半开边界一致。未配对的 enter（最终仍未离开）其区间止端
+    取 +inf，交由调用方按窗口截断。
     """
     by_device: dict[str, list[tuple[float, str]]] = {}
     for device_id, etype, ts in events:
@@ -201,7 +204,7 @@ def presence_intervals(events: list[tuple[str, str, float]]) -> list[tuple[str, 
 
     intervals: list[tuple[str, float, float]] = []  # (设备, 起, 止)
     for device_id, evs in by_device.items():
-        evs.sort(key=lambda x: (x[0], 0 if x[1] == EVENT_ENTER else 1))
+        evs.sort(key=lambda x: (x[0], 0 if x[1] == EVENT_LEAVE else 1))
         open_since: float | None = None
         for ts, etype in evs:
             if etype == EVENT_ENTER:
@@ -918,38 +921,6 @@ class HandoverReport:
         return None
 
 
-def _presence_intervals_leave_first(
-    events: list[tuple[str, str, float]]
-) -> dict[str, list[tuple[float, float]]]:
-    """由 enter/leave 事件按设备重放半开在场区间 [enter, leave)。
-
-    与 presence_intervals 的区别：同一设备同一时刻既有 leave 又有 enter 时
-    **离开先配对**（与协同到场扫描线的半开边界一致）——旧区间止端不含 t、
-    新区间起端含 t。未配对的 enter 止端取 +inf，交由调用方按窗口截断。
-    """
-    by_device: dict[str, list[tuple[float, str]]] = {}
-    for device_id, etype, ts in events:
-        if etype in (EVENT_ENTER, EVENT_LEAVE):
-            by_device.setdefault(device_id, []).append((ts, etype))
-
-    result: dict[str, list[tuple[float, float]]] = {}
-    for device_id, evs in by_device.items():
-        evs.sort(key=lambda x: (x[0], 0 if x[1] == EVENT_LEAVE else 1))
-        intervals: list[tuple[float, float]] = []
-        open_since: float | None = None
-        for ts, etype in evs:
-            if etype == EVENT_ENTER:
-                if open_since is None:
-                    open_since = ts
-            elif open_since is not None:
-                intervals.append((open_since, ts))
-                open_since = None
-        if open_since is not None:
-            intervals.append((open_since, math.inf))
-        result[device_id] = intervals
-    return result
-
-
 def compute_handover_report(
     events: list[tuple[str, str, float]],
     members: list[str],
@@ -960,22 +931,27 @@ def compute_handover_report(
 ) -> HandoverReport:
     """由 enter/leave 事件还原接力交班核验报告。
 
-    各设备在场区间一律为半开区间 [enter, leave)，截断到有效窗口
-    [start, end)（窗口前已进入、窗口结束仍未离开的区间正确截断）。
+    各设备在场区间一律为半开区间 [enter, leave)，由 presence_intervals 统一
+    重放（同刻离开先于进入），截断到有效窗口 [start, end)（窗口前已进入、
+    窗口结束仍未离开的区间正确截断）。
 
     交班链选择（动态规划）：把每台设备的每个窗口内区间视为一个节点，
     相邻序号 i -> i+1 的两个区间在时间推进（接班区间起端不早于接班时刻）
     且满足交班约束时连边——两段相交（接班起端 < 交班止端）要求交叠时长
-    >= min_overlap_s（含等于）；两段分离（接班起端 >= 交班止端）要求空档
-    <= max_gap_s（含等于，首尾相接空档为 0）。选择通过的相邻交班步数最多
-    的链；并列时按各步接班时刻组成的元组字典序最早（首步并列取最早到岗）。
+    >= min_overlap_s（含等于，门槛可为 0）；两段分离（接班起端 >= 交班止端）
+    要求空档 <= max_gap_s（含等于，首尾相接空档为 0）。选择通过的相邻交班
+    步数最多的链；并列时按各步接班时刻组成的元组字典序最早（首步并列取
+    最早到岗）。汇聚到同一节点的多个前缀只保留该最优前缀，因此后续区间
+    能否延伸不会让字典序更早的前缀丢失。
 
     链一旦无法延伸即停止：接班设备无满足时间推进的区间记 absent；
     有区间但最早候选交叠不足记 overlap_insufficient、空档超限记
     gap_exceeded（违规时刻分别为交叠结束时刻与空档超限时刻），
     其余序号记 not_reached。
     """
-    per_device = _presence_intervals_leave_first(events)
+    per_device: dict[str, list[tuple[float, float]]] = {}
+    for device_id, s, e in presence_intervals(events):
+        per_device.setdefault(device_id, []).append((s, e))
 
     # 每台设备截断到窗口 [start, end) 的非空区间，按起端升序
     clipped: list[list[tuple[float, float]]] = []
@@ -996,6 +972,9 @@ def compute_handover_report(
 
     # best[position][j] = 以 clipped[position][j] 结尾的最优前缀
     # 取值 (通过步数, 接班时刻元组, 首步区间下标, 前驱 position, 前驱 j)
+    # 汇聚到同一节点的多个前缀择优保留：步数最多，其次接班时刻元组字典序
+    # 最早，再并列取首台最早到岗区间（确定性）。节点之后的延伸只依赖该节点
+    # 自身区间，故丢掉较差前缀不影响任何后续链，且不会丢掉全局最早候选。
     best: list[list[tuple]] = []
     best.append([(0, (), j, -1, -1) for j in range(len(clipped[0]))])
     for pos in range(1, len(members)):
@@ -1009,7 +988,16 @@ def compute_handover_report(
                 if not valid_edge((ps, pe), (js, je)):
                     continue
                 candidate = (prev[0] + 1, prev[1] + (js,), prev[2], pos - 1, k)
-                if choice is None or (candidate[0], candidate[1]) > (choice[0], choice[1]):
+                if choice is None or (
+                    candidate[0] > choice[0]
+                    or (
+                        candidate[0] == choice[0]
+                        and (
+                            candidate[1] < choice[1]
+                            or (candidate[1] == choice[1] and candidate[2] < choice[2])
+                        )
+                    )
+                ):
                     choice = candidate
             cur.append(choice)  # type: ignore[arg-type]
         best.append(cur)

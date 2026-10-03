@@ -1193,8 +1193,8 @@ def create_handover_task(
     """创建设备接力交班任务：2～8 台按交班顺序排列且不重复的设备。
 
     另需半开有效窗口（开始严格早于结束）、相邻交班允许的最大空档
-    max_gap_s（非负）与最短交叠时长 min_overlap_s（正数）。成员数量、
-    重复、空 ID、窗口无效或时长非法均返回 422；围栏不存在返回 404。
+    max_gap_s（非负）与最短交叠时长 min_overlap_s（非负，0 表示相交即达标）。
+    成员数量、重复、空 ID、窗口无效或时长非法均返回 422；围栏不存在返回 404。
     """
     if db.get(Fence, fence_id) is None:
         raise HTTPException(status_code=404, detail="围栏不存在")
